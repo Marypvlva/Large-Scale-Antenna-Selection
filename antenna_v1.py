@@ -24,12 +24,25 @@ BATCH_OFF_VALUES = [0.25, 0.5]
 
 
 # Основные настройки алгоритма
+SOLVER_MODE = "fast"  # "fast" or "quality"
 MAX_PASSES = 30
 TARGET_GAIN = 5.5
+EARLY_STOP_ON_TARGET = True
+
+# Fast mode runs H1/H2 starts first and computes the expensive greedy start
+# only when the best staged gain is still modest. Quality mode always runs it.
+CONDITIONAL_GREEDY_GAIN = 20.0
 
 # Быстрый swap для обычных случаев
 QUICK_REMOVE_LIMIT = 300
 QUICK_ADD_LIMIT = 300
+
+# Adaptive widening: if the quick candidate pool is not enough, polish the
+# incumbent with larger neighborhoods before entering heavier rescue phases.
+USE_ADAPTIVE_WIDENING = True
+WIDENING_LIMITS = [(500, 500), (800, 800)]
+WIDENING_PASSES = 20
+WIDENING_STOP_GAIN = 100.0
 
 # Smart candidate pool: gradient + power + spectral alignment
 USE_SMART_CANDIDATES = True
@@ -60,6 +73,17 @@ USE_RANDOM_RESCUE = True
 RANDOM_STRENGTHS = [3, 5, 10, 20, 30, 50]
 RANDOM_RESTARTS = 8
 RANDOM_STOP_GAIN = 550.0
+
+# Forced escape rescue: leave a 1-swap local optimum through one controlled
+# worsening/equal swap, then polish again. This is a variable-neighborhood step.
+USE_FORCED_ESCAPE_RESCUE = True
+FORCED_ESCAPE_ROUNDS = 1
+FORCED_ESCAPE_WIDTH = 3
+FORCED_ESCAPE_REMOVE_LIMIT = 120
+FORCED_ESCAPE_ADD_LIMIT = 120
+FORCED_ESCAPE_POLISH_PASSES = 8
+FORCED_ESCAPE_ALL_QUICK_STARTS = False
+FORCED_ESCAPE_STOP_GAIN = 150.0
 
 # Экспериментальные фазы, которые тестировали и выключили: не окупились.
 USE_MULTISWAP_RESCUE = False
@@ -516,6 +540,160 @@ def vectorized_swap_local_search(
 
 
 # ============================================================
+# Variable-neighborhood escape
+# ============================================================
+
+def top_swap_candidates(
+    V,
+    active,
+    sigma=1.0,
+    remove_limit=300,
+    add_limit=300,
+    max_candidates=8,
+):
+    """
+    Return the best one-swap candidates from the current neighborhood.
+
+    Unlike local search, this also returns non-improving swaps. Forcing one of
+    these controlled moves can leave a strict 1-swap local optimum; the result is
+    then polished by local search.
+    """
+    A = row_outer_mats(V)
+    s = row_powers(V)
+
+    S = build_S(V, active)
+    base = logdet_score_from_S(S, np.max(s[active]), sigma)
+    eye = np.eye(V.shape[1])
+
+    rem_order, add_order = build_candidate_orders(
+        V,
+        active,
+        S,
+        s,
+        remove_limit=remove_limit,
+        add_limit=add_limit,
+        sigma=sigma,
+    )
+
+    act_idx = np.flatnonzero(active)
+    active_s = s[act_idx]
+    sorted_active = act_idx[np.argsort(active_s)]
+
+    max1_i = sorted_active[-1]
+    max1 = s[max1_i]
+    max2 = s[sorted_active[-2]] if len(sorted_active) >= 2 else max1
+
+    A_add = A[add_order]
+    s_add = s[add_order]
+    candidates = []
+
+    for i in rem_order:
+        S_minus = S - A[i]
+        max_without_i = max2 if i == max1_i else max1
+
+        max_s_new = np.maximum(max_without_i, s_add)
+        z = 1.0 / np.sqrt(max_s_new)
+
+        S_batch = S_minus[None, :, :] + A_add
+        G_batch = S_batch * z[:, None, None]
+
+        M_batch = G_batch @ np.swapaxes(G_batch.conj(), 1, 2)
+        M_batch += sigma * eye[None, :, :]
+
+        signs, logdets = np.linalg.slogdet(M_batch)
+        scores = np.where(signs > 0, np.real(logdets), -1e100)
+
+        take = min(max_candidates, len(scores))
+        if take == 0:
+            continue
+
+        top_pos = np.argpartition(-scores, take - 1)[:take]
+        for pos in top_pos:
+            candidates.append((float(scores[pos]), int(i), int(add_order[pos])))
+
+    candidates.sort(key=lambda x: x[0], reverse=True)
+
+    # Deduplicate by swap pair while preserving score order.
+    unique = []
+    seen = set()
+    for score, i, j in candidates:
+        key = (i, j)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append((score, i, j))
+        if len(unique) >= max_candidates:
+            break
+
+    return base, unique
+
+
+def forced_escape_refinement(
+    V,
+    active,
+    sigma=1.0,
+    rounds=3,
+    escape_width=8,
+    remove_limit=300,
+    add_limit=300,
+    polish_passes=20,
+):
+    """
+    Variable-neighborhood refinement around a polished solution.
+
+    Each round takes the top controlled escape swaps from the current incumbent,
+    forces them one at a time, and applies the usual one-swap local search. The
+    best polished result becomes the next incumbent.
+    """
+    incumbent = active.copy()
+    incumbent_score = logdet_score(V, incumbent, sigma)
+
+    for _ in range(rounds):
+        _, candidates = top_swap_candidates(
+            V,
+            incumbent,
+            sigma=sigma,
+            remove_limit=remove_limit,
+            add_limit=add_limit,
+            max_candidates=escape_width,
+        )
+
+        if not candidates:
+            break
+
+        round_best = incumbent
+        round_best_score = incumbent_score
+
+        for _, i, j in candidates:
+            escaped = incumbent.copy()
+            escaped[i] = False
+            escaped[j] = True
+
+            polished = vectorized_swap_local_search(
+                V,
+                escaped,
+                sigma=sigma,
+                max_passes=polish_passes,
+                remove_limit=remove_limit,
+                add_limit=add_limit,
+                verbose=False,
+            )
+
+            sc = logdet_score(V, polished, sigma)
+            if sc > round_best_score + 1e-12:
+                round_best = polished
+                round_best_score = sc
+
+        if round_best_score <= incumbent_score + 1e-12:
+            break
+
+        incumbent = round_best
+        incumbent_score = round_best_score
+
+    return incumbent
+
+
+# ============================================================
 # Rescue methods
 # ============================================================
 
@@ -708,6 +886,9 @@ def package_result(
     ours_score,
     gain_percent,
     used_rescue,
+    used_greedy,
+    used_escape,
+    used_widening,
     used_spectral,
     used_anneal,
     used_random,
@@ -722,6 +903,9 @@ def package_result(
         "ours_score": ours_score,
         "gain_percent": gain_percent,
         "used_rescue": used_rescue,
+        "used_greedy": used_greedy,
+        "used_escape": used_escape,
+        "used_widening": used_widening,
         "used_spectral": used_spectral,
         "used_anneal": used_anneal,
         "used_random": used_random,
@@ -741,17 +925,26 @@ def solve_general(
     sigma=1.0,
     max_passes=30,
     target_gain=5.5,
+    early_stop_on_target=True,
+    solver_mode="fast",
+    conditional_greedy_gain=20.0,
     verbose=False,
 ):
+    solver_mode = solver_mode.lower()
+    if solver_mode not in {"fast", "quality"}:
+        raise ValueError("solver_mode must be either 'fast' or 'quality'")
+
     rng = np.random.default_rng(seed + 1000003)
 
+    used_greedy = False
+    used_escape = False
+    used_widening = False
     used_spectral = False
     used_anneal = False
     used_random = False
 
     h1 = h1_weakest_deletion(V, n_active)
     h2 = h2_interference_deletion(V, n_active)
-    greedy = greedy_rank_one_deletion(V, n_active, sigma=sigma, verbose=False)
 
     h1_u = raw_det_score(V, h1, sigma)
     h2_u = raw_det_score(V, h2, sigma)
@@ -765,16 +958,18 @@ def solve_general(
     # Phase 1: fast starts
     # --------------------------------------------------------
 
-    quick_starts = [
+    staged_starts = [
         ("H1+swap", h1),
         ("H2+swap", h2),
-        ("greedy+swap", greedy),
     ]
+    quick_candidates = []
 
     if verbose:
-        print("[phase 1] quick starts")
+        print("[phase 1] staged H1/H2 starts")
 
-    for name, start_active in quick_starts:
+    def try_quick_start(name, start_active):
+        nonlocal best_logdet, best_active, best_name
+
         t = time.time()
 
         improved = improve_from_start(
@@ -787,6 +982,7 @@ def solve_general(
         )
 
         sc = logdet_score(V, improved, sigma)
+        quick_candidates.append((name, improved))
 
         if verbose:
             raw = raw_det_score(V, improved, sigma)
@@ -801,12 +997,37 @@ def solve_general(
             best_active = improved
             best_name = name
 
+    for name, start_active in staged_starts:
+        try_quick_start(name, start_active)
+
     best_raw, current_gain = current_gain_percent(best_active, V, best_baseline, sigma)
 
-    if verbose:
-        print(f"[quick gain] {current_gain:.4f}%")
+    run_greedy = (
+        solver_mode == "quality"
+        or current_gain < conditional_greedy_gain
+        or not early_stop_on_target
+    )
 
-    if current_gain >= target_gain:
+    if run_greedy:
+        if verbose:
+            print("[phase 1b] greedy rank-one start")
+
+        t = time.time()
+        greedy = greedy_rank_one_deletion(V, n_active, sigma=sigma, verbose=False)
+        used_greedy = True
+
+        if verbose:
+            print(f"[greedy start] built mask time={time.time() - t:.2f}s")
+
+        try_quick_start("greedy+swap", greedy)
+        best_raw, current_gain = current_gain_percent(best_active, V, best_baseline, sigma)
+    else:
+        greedy = None
+
+    if verbose:
+        print(f"[staged gain] {current_gain:.4f}%")
+
+    if early_stop_on_target and current_gain >= target_gain:
         return package_result(
             active=best_active,
             method=best_name,
@@ -817,6 +1038,9 @@ def solve_general(
             ours_score=best_raw,
             gain_percent=current_gain,
             used_rescue=False,
+            used_greedy=used_greedy,
+            used_escape=False,
+            used_widening=False,
             used_spectral=False,
             used_anneal=False,
             used_random=False,
@@ -876,6 +1100,9 @@ def solve_general(
                 ours_score=best_raw_now,
                 gain_percent=gain_now,
                 used_rescue=True,
+                used_greedy=used_greedy,
+                used_escape=used_escape,
+                used_widening=used_widening,
                 used_spectral=used_spectral,
                 used_anneal=used_anneal,
                 used_random=used_random,
@@ -884,7 +1111,89 @@ def solve_general(
         return None
 
     # --------------------------------------------------------
-    # Phase 2A: spectral weak/strong rescue
+    # Phase 2A: adaptive candidate-pool widening
+    # --------------------------------------------------------
+
+    if USE_ADAPTIVE_WIDENING:
+        for remove_limit, add_limit in WIDENING_LIMITS:
+            t = time.time()
+
+            improved = improve_from_start(
+                V,
+                best_active,
+                sigma=sigma,
+                max_passes=WIDENING_PASSES,
+                remove_limit=remove_limit,
+                add_limit=add_limit,
+            )
+
+            sc = logdet_score(V, improved, sigma)
+            used_widening = True
+
+            if verbose:
+                raw = raw_det_score(V, improved, sigma)
+                print(
+                    f"[candidate] widen{remove_limit}x{add_limit}+swap         "
+                    f"logdet={sc:.10f} det={raw:.10e} "
+                    f"time={time.time() - t:.2f}s"
+                )
+
+            if sc > best_logdet:
+                best_logdet = sc
+                best_active = improved
+                best_name = f"widen{remove_limit}x{add_limit}+swap"
+
+            if early_stop_on_target:
+                out = maybe_return_if_gain_at_least(WIDENING_STOP_GAIN)
+                if out is not None:
+                    return out
+
+    # --------------------------------------------------------
+    # Phase 2B: forced local-optimum escape
+    # --------------------------------------------------------
+
+    if USE_FORCED_ESCAPE_RESCUE:
+        escape_starts = [("best", best_active)]
+        if FORCED_ESCAPE_ALL_QUICK_STARTS:
+            escape_starts += quick_candidates
+
+        for base_name, base_mask in escape_starts:
+            t = time.time()
+
+            improved = forced_escape_refinement(
+                V,
+                base_mask,
+                sigma=sigma,
+                rounds=FORCED_ESCAPE_ROUNDS,
+                escape_width=FORCED_ESCAPE_WIDTH,
+                remove_limit=FORCED_ESCAPE_REMOVE_LIMIT,
+                add_limit=FORCED_ESCAPE_ADD_LIMIT,
+                polish_passes=FORCED_ESCAPE_POLISH_PASSES,
+            )
+
+            sc = logdet_score(V, improved, sigma)
+            used_escape = True
+
+            if verbose:
+                raw = raw_det_score(V, improved, sigma)
+                print(
+                    f"[candidate] escape-{base_name}+swap             "
+                    f"logdet={sc:.10f} det={raw:.10e} "
+                    f"time={time.time() - t:.2f}s"
+                )
+
+            if sc > best_logdet:
+                best_logdet = sc
+                best_active = improved
+                best_name = f"escape-{base_name}+swap"
+
+            if early_stop_on_target:
+                out = maybe_return_if_gain_at_least(FORCED_ESCAPE_STOP_GAIN)
+                if out is not None:
+                    return out
+
+    # --------------------------------------------------------
+    # Phase 2C: spectral weak/strong rescue
     # --------------------------------------------------------
 
     if USE_SPECTRAL_RESCUE:
@@ -892,8 +1201,9 @@ def solve_general(
             ("best", best_active),
             ("H1", h1),
             ("H2", h2),
-            ("greedy", greedy),
         ]
+        if greedy is not None:
+            base_masks.append(("greedy", greedy))
 
         for base_name, base_mask in base_masks:
             for strength in SPECTRAL_STRENGTHS:
@@ -912,12 +1222,13 @@ def solve_general(
                     "spectral",
                 )
 
-                out = maybe_return_if_gain_at_least(SPECTRAL_STOP_GAIN)
-                if out is not None:
-                    return out
+                if early_stop_on_target:
+                    out = maybe_return_if_gain_at_least(SPECTRAL_STOP_GAIN)
+                    if out is not None:
+                        return out
 
     # --------------------------------------------------------
-    # Phase 2B: annealing rescue inside smart candidate pool
+    # Phase 2D: annealing rescue inside smart candidate pool
     # --------------------------------------------------------
 
     if USE_ANNEAL_RESCUE:
@@ -925,8 +1236,9 @@ def solve_general(
             ("best", best_active),
             ("H1", h1),
             ("H2", h2),
-            ("greedy", greedy),
         ]
+        if greedy is not None:
+            base_masks.append(("greedy", greedy))
 
         anneal_counter = 0
 
@@ -956,16 +1268,20 @@ def solve_general(
                         "anneal",
                     )
 
-                    out = maybe_return_if_gain_at_least(ANNEAL_STOP_GAIN)
-                    if out is not None:
-                        return out
+                    if early_stop_on_target:
+                        out = maybe_return_if_gain_at_least(ANNEAL_STOP_GAIN)
+                        if out is not None:
+                            return out
 
     # --------------------------------------------------------
-    # Phase 2C: random fallback in stable order
+    # Phase 2E: random fallback in stable order
     # --------------------------------------------------------
 
     if USE_RANDOM_RESCUE:
-        base_masks = [h1, h2, greedy, best_active]
+        base_masks = [h1, h2]
+        if greedy is not None:
+            base_masks.append(greedy)
+        base_masks.append(best_active)
         count = 0
 
         for base in base_masks:
@@ -985,9 +1301,10 @@ def solve_general(
 
                 count += 1
 
-                out = maybe_return_if_gain_at_least(RANDOM_STOP_GAIN)
-                if out is not None:
-                    return out
+                if early_stop_on_target:
+                    out = maybe_return_if_gain_at_least(RANDOM_STOP_GAIN)
+                    if out is not None:
+                        return out
 
             if count >= RANDOM_RESTARTS:
                 break
@@ -1004,6 +1321,9 @@ def solve_general(
         ours_score=best_raw,
         gain_percent=current_gain,
         used_rescue=True,
+        used_greedy=used_greedy,
+        used_escape=used_escape,
+        used_widening=used_widening,
         used_spectral=used_spectral,
         used_anneal=used_anneal,
         used_random=used_random,
@@ -1030,6 +1350,9 @@ def run_single_case(N, L, off, seed, verbose=True):
         sigma=SIGMA,
         max_passes=MAX_PASSES,
         target_gain=TARGET_GAIN,
+        early_stop_on_target=EARLY_STOP_ON_TARGET,
+        solver_mode=SOLVER_MODE,
+        conditional_greedy_gain=CONDITIONAL_GREEDY_GAIN,
         verbose=verbose,
     )
 
@@ -1039,6 +1362,9 @@ def run_single_case(N, L, off, seed, verbose=True):
     print(f"Ours     = {result['ours_score']:.10e}")
     print(f"best start/method = {result['method']}")
     print(f"used rescue   = {result['used_rescue']}")
+    print(f"used greedy   = {result['used_greedy']}")
+    print(f"used escape   = {result['used_escape']}")
+    print(f"used widening = {result['used_widening']}")
     print(f"used spectral = {result['used_spectral']}")
     print(f"used anneal   = {result['used_anneal']}")
     print(f"used random   = {result['used_random']}")
@@ -1059,6 +1385,7 @@ def run_batch():
     print("Running batch for GENERAL objective...")
     print(
         f"N_values={BATCH_N_VALUES}, target_gain={TARGET_GAIN}, max_passes={MAX_PASSES}, "
+        f"solver_mode={SOLVER_MODE}, conditional_greedy_gain={CONDITIONAL_GREEDY_GAIN}, "
         f"quick_limits=({QUICK_REMOVE_LIMIT}, {QUICK_ADD_LIMIT}), "
         f"smart_candidates={USE_SMART_CANDIDATES}, "
         f"spectral={USE_SPECTRAL_RESCUE}, anneal={USE_ANNEAL_RESCUE}, "
@@ -1084,6 +1411,9 @@ def run_batch():
                         sigma=SIGMA,
                         max_passes=MAX_PASSES,
                         target_gain=TARGET_GAIN,
+                        early_stop_on_target=EARLY_STOP_ON_TARGET,
+                        solver_mode=SOLVER_MODE,
+                        conditional_greedy_gain=CONDITIONAL_GREEDY_GAIN,
                         verbose=False,
                     )
 
@@ -1102,6 +1432,9 @@ def run_batch():
                         "gain_percent": result["gain_percent"],
                         "best_method": result["method"],
                         "used_rescue": result["used_rescue"],
+                        "used_greedy": result["used_greedy"],
+                        "used_escape": result["used_escape"],
+                        "used_widening": result["used_widening"],
                         "used_spectral": result["used_spectral"],
                         "used_anneal": result["used_anneal"],
                         "used_random": result["used_random"],
@@ -1115,6 +1448,9 @@ def run_batch():
                         f"gain={result['gain_percent']:9.3f}% "
                         f"method={result['method'][:38]:38s} "
                         f"res={str(result['used_rescue']):5s} "
+                        f"grd={str(result['used_greedy']):5s} "
+                        f"esc={str(result['used_escape']):5s} "
+                        f"wide={str(result['used_widening']):5s} "
                         f"spec={str(result['used_spectral']):5s} "
                         f"ann={str(result['used_anneal']):5s} "
                         f"rand={str(result['used_random']):5s} "
