@@ -14,7 +14,6 @@
 - Final proposed method: `solve_general` (`Ours`)
 - Comparator: hidden weak+strong heuristic
 
-The fixed seed makes the sequence reproducible, but the generated matrices are still random draws; the CSV contains no repeated benchmark rows.
 
 ## Summary
 
