@@ -105,10 +105,14 @@ SAVE_BATCH_MASKS = False
 # Data generation
 # ============================================================
 
-def generate_V(N: int, L: int, seed: int = 0) -> np.ndarray:
-    rng = np.random.default_rng(seed)
+def generate_V(N: int, L: int) -> np.ndarray:
+    """
+    Generate input data exactly in the style of the task appendix.
 
-    V = rng.normal(size=(N, L)) + 1j * rng.normal(size=(N, L))
+    Reproducibility is controlled outside this function through the global
+    NumPy seed, e.g. `np.random.seed(seed)` before calling `generate_V`.
+    """
+    V = np.random.normal(size=(N, L)) + 1j * np.random.normal(size=(N, L))
 
     column_norms = np.linalg.norm(V, axis=0)
     V = V / column_norms
@@ -336,6 +340,29 @@ def h1_weakest_deletion(V, n_active):
     n_off = N - n_active
 
     off = np.argsort(s)[:n_off]
+
+    active = np.ones(N, dtype=bool)
+    active[off] = False
+
+    return active
+
+
+def h3_weakest_strongest_deletion(V, n_active):
+    """
+    Hidden heuristic:
+    switch off half of the weakest and half of the strongest antennas.
+    """
+    s = row_powers(V)
+    N = V.shape[0]
+    n_off = N - n_active
+
+    n_weak = n_off // 2
+    n_strong = n_off - n_weak
+
+    order = np.argsort(s)
+    off_weak = order[:n_weak]
+    off_strong = order[-n_strong:] if n_strong > 0 else np.array([], dtype=int)
+    off = np.concatenate([off_weak, off_strong])
 
     active = np.ones(N, dtype=bool)
     active[off] = False
@@ -945,6 +972,7 @@ def solve_general(
 
     h1 = h1_weakest_deletion(V, n_active)
     h2 = h2_interference_deletion(V, n_active)
+    h3 = h3_weakest_strongest_deletion(V, n_active)
 
     h1_u = raw_det_score(V, h1, sigma)
     h2_u = raw_det_score(V, h2, sigma)
@@ -961,6 +989,7 @@ def solve_general(
     staged_starts = [
         ("H1+swap", h1),
         ("H2+swap", h2),
+        ("H3-hidden+swap", h3),
     ]
     quick_candidates = []
 
@@ -1201,6 +1230,7 @@ def solve_general(
             ("best", best_active),
             ("H1", h1),
             ("H2", h2),
+            ("H3-hidden", h3),
         ]
         if greedy is not None:
             base_masks.append(("greedy", greedy))
@@ -1236,6 +1266,7 @@ def solve_general(
             ("best", best_active),
             ("H1", h1),
             ("H2", h2),
+            ("H3-hidden", h3),
         ]
         if greedy is not None:
             base_masks.append(("greedy", greedy))
@@ -1278,7 +1309,7 @@ def solve_general(
     # --------------------------------------------------------
 
     if USE_RANDOM_RESCUE:
-        base_masks = [h1, h2]
+        base_masks = [h1, h2, h3]
         if greedy is not None:
             base_masks.append(greedy)
         base_masks.append(best_active)
@@ -1337,7 +1368,8 @@ def solve_general(
 def run_single_case(N, L, off, seed, verbose=True):
     t0 = time.time()
 
-    V = generate_V(N, L, seed)
+    np.random.seed(seed)
+    V = generate_V(N, L)
     n_active = int(round(N * (1.0 - off)))
 
     print(f"N={N}, L={L}, off={off}, active={n_active}, seed={seed}")
@@ -1401,7 +1433,8 @@ def run_batch():
                 for seed in BATCH_SEEDS:
                     t0 = time.time()
 
-                    V = generate_V(current_N, L, seed)
+                    np.random.seed(seed)
+                    V = generate_V(current_N, L)
                     n_active = int(round(current_N * (1.0 - off)))
 
                     result = solve_general(

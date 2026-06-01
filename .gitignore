@@ -1,6 +1,7 @@
+.DS_Store
 .venv/
 __pycache__/
-*.pyc
-*.csv
-*.npy
-.DS_Store
+*.py[cod]
+antenna_batch_results.csv
+active_mask_*.npy
+full_validation.log
